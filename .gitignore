@@ -1,0 +1,17 @@
+# Secrets and credentials
+config/
+.env
+#claude settings
+.claude/
+# Generated output
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+.qodo/

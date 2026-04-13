@@ -1,0 +1,52 @@
+name: Daily Outreach Report
+
+on:
+  schedule:
+    # 9:00 AM PKT = 4:00 AM UTC (PKT is UTC+5)
+    # Change the cron expression to adjust the time
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic google-api-python-client google-auth-httplib2 \
+                    google-auth-oauthlib python-dotenv rich
+
+      - name: Write config files from secrets
+        run: |
+          mkdir -p config
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > config/credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN }}' > config/token.json
+          echo '${{ secrets.AGENT_CONFIG }}' > config/agent_config.json
+
+      - name: Write .env from secrets
+        run: |
+          echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" > .env
+          echo "SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}" >> .env
+
+      - name: Run outreach agent
+        env:
+          AGENT_USERNAME: "Baqir"
+        run: python run_agent.py
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outreach-report-${{ github.run_number }}
+          path: reports/*.md
+          retention-days: 30
