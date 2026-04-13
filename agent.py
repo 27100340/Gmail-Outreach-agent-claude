@@ -1,15 +1,14 @@
 """
-Outreach monitoring agent — session management, streaming, and reporting.
-
-Creates a Managed Agent session on Anthropic's platform, sends the monitoring
-prompt, handles Gmail tool calls locally via the streaming loop, and saves
-the resulting report to disk.
+Outreach monitoring agent — pre-filters contacts locally, reads threads
+via Gmail API, and sends ONE Claude Messages API call for classification
+and report generation. No Managed Agents, no streaming, no tool calls.
 """
 
 import anthropic
 import json
 import os
 import re
+import base64
 import urllib.request
 from datetime import datetime
 
@@ -20,7 +19,6 @@ from googleapiclient.discovery import build
 from rich.console import Console
 from rich.panel import Panel
 
-from gmail_tools import build_tool_handlers
 from prefilter import scan_watchlist
 
 # ─── Load .env ──────────────────────────────────────────────
@@ -36,7 +34,6 @@ REPORT_DIR = os.path.join(ROOT_DIR, "reports")
 WATCHLIST_FILE = os.path.join(ROOT_DIR, "watchlist", "contacts.txt")
 
 TOKEN_FILE = os.path.join(CONFIG_DIR, "token.json")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "agent_config.json")
 
 # ─── Watchlist ──────────────────────────────────────────────
 
@@ -58,12 +55,6 @@ WATCHLIST = _load_watchlist()
 
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-with open(CONFIG_FILE, "r") as f:
-    _config = json.load(f)
-
-AGENT_ID = _config["agent_id"]
-ENVIRONMENT_ID = _config["environment_id"]
-
 # Gmail
 _creds = Credentials.from_authorized_user_file(
     TOKEN_FILE,
@@ -75,63 +66,109 @@ if _creds.expired and _creds.refresh_token:
         f.write(_creds.to_json())
 
 gmail = build("gmail", "v1", credentials=_creds)
-TOOL_HANDLERS = build_tool_handlers(gmail)
 
-# Anthropic
+# Anthropic (regular Messages API — no Managed Agents)
 anthropic_client = anthropic.Anthropic()
 
-# ─── Display helpers ────────────────────────────────────────
+# ─── Local thread reader ───────────────────────────────────
 
-def _friendly_tool_message(tool_name, tool_input):
-    """Convert a tool call into a human-readable status message."""
-    if tool_name == "gmail_search":
-        query = tool_input.get("query", "")
-        match = re.search(r'(?:to:|from:)(\S+)', query)
-        addr = match.group(1) if match else None
-        if "is:sent" in query and addr:
-            return f"Checking sent emails to [cyan]{addr}[/cyan]"
-        if "from:" in query and addr:
-            return f"Checking replies from [cyan]{addr}[/cyan]"
-        if "is:unread" in query:
-            return "Scanning other unread emails in inbox"
-        return "Searching Gmail"
-    if tool_name == "gmail_get_thread":
-        return "Reading full email thread"
-    if tool_name == "gmail_create_draft":
-        return f"Creating draft email to [cyan]{tool_input.get('to', '?')}[/cyan]"
-    return f"Running {tool_name}"
+def _read_thread(thread_id):
+    """Read a full Gmail thread locally. Returns formatted string."""
+    try:
+        thread = gmail.users().threads().get(
+            userId="me", id=thread_id, format="full"
+        ).execute()
+    except Exception as e:
+        return f"[Could not read thread {thread_id}: {e}]"
 
+    msgs = []
+    for msg in thread.get("messages", []):
+        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+
+        body = ""
+        payload = msg["payload"]
+        if "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
+                    body = base64.urlsafe_b64decode(
+                        part["body"]["data"]
+                    ).decode("utf-8", errors="replace")
+                    break
+        elif "body" in payload and "data" in payload["body"]:
+            body = base64.urlsafe_b64decode(
+                payload["body"]["data"]
+            ).decode("utf-8", errors="replace")
+
+        if not body:
+            body = msg.get("snippet", "")
+
+        msgs.append(
+            f"From: {headers.get('From', '')}\n"
+            f"To: {headers.get('To', '')}\n"
+            f"Date: {headers.get('Date', '')}\n"
+            f"Subject: {headers.get('Subject', '')}\n"
+            f"Body: {body[:500]}"
+        )
+
+    return "\n---\n".join(msgs)
+
+
+def _search_unread_inbox(watchlist_exclusions):
+    """Search for unread emails not from watched contacts. Returns formatted string."""
+    query = f"is:unread {watchlist_exclusions} newer_than:7d"
+    try:
+        resp = gmail.users().messages().list(
+            userId="me", q=query, maxResults=30
+        ).execute()
+    except Exception:
+        return "Could not search unread inbox."
+
+    messages = resp.get("messages", [])
+    if not messages:
+        return "No other unread emails found."
+
+    entries = []
+    for msg in messages:
+        detail = gmail.users().messages().get(
+            userId="me", id=msg["id"], format="metadata",
+            metadataHeaders=["Subject", "From", "Date"]
+        ).execute()
+        headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+        entries.append(
+            f"From: {headers.get('From', '')}\n"
+            f"Subject: {headers.get('Subject', '(no subject)')}\n"
+            f"Date: {headers.get('Date', '')}\n"
+            f"Snippet: {detail.get('snippet', '')}"
+        )
+
+    return "\n---\n".join(entries)
+
+# ─── Slack helpers ──────────────────────────────────────────
 
 def _md_to_slack_mrkdwn(text):
     """Convert markdown report to Slack mrkdwn format."""
     lines = text.split("\n")
     converted = []
     for line in lines:
-        # ## Heading → *Heading* (bold)
         if line.startswith("## "):
             converted.append(f"*{line[3:].strip()}*")
-        # # Title → *Title* (bold)
         elif line.startswith("# "):
             converted.append(f"*{line[2:].strip()}*")
-        # **bold** → *bold*
         else:
-            # Replace **text** with *text*
             converted.append(re.sub(r"\*\*(.+?)\*\*", r"*\1*", line))
     return "\n".join(converted)
 
 
 def _build_slack_blocks(report_text):
-    """Build Slack Block Kit blocks from the report for rich formatting."""
+    """Build Slack Block Kit blocks from the report."""
     slack_text = _md_to_slack_mrkdwn(report_text)
 
-    # Split on section headers (lines that are *bold* and look like headers)
     sections = []
     current_header = None
     current_lines = []
 
     for line in slack_text.split("\n"):
         stripped = line.strip()
-        # Detect section headers: lines that are fully bold like *P1 – Urgent (3)*
         if (
             stripped.startswith("*")
             and stripped.endswith("*")
@@ -141,7 +178,6 @@ def _build_slack_blocks(report_text):
             or stripped.startswith("*Watched Contacts")
             or stripped.startswith("*Drafts created")
         ):
-            # Save previous section
             if current_header or current_lines:
                 sections.append((current_header, "\n".join(current_lines).strip()))
             current_header = stripped
@@ -149,14 +185,11 @@ def _build_slack_blocks(report_text):
         else:
             current_lines.append(line)
 
-    # Save last section
     if current_header or current_lines:
         sections.append((current_header, "\n".join(current_lines).strip()))
 
-    # Build Block Kit blocks
     blocks = []
 
-    # Title header
     title = sections[0][0] if sections and sections[0][0] else "*Daily Inbox Summary*"
     blocks.append({
         "type": "header",
@@ -168,9 +201,7 @@ def _build_slack_blocks(report_text):
         if not header and not body:
             continue
 
-        # Section header
         if header:
-            # Pick emoji based on content
             emoji = ""
             h = header.lower()
             if "p1" in h or "urgent" in h:
@@ -190,18 +221,14 @@ def _build_slack_blocks(report_text):
             elif "drafts" in h:
                 emoji = ":pencil2: "
 
-            header_text = f"{emoji}{header}"
             blocks.append({
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": header_text}
+                "text": {"type": "mrkdwn", "text": f"{emoji}{header}"}
             })
 
-        # Section body — Slack limits each text block to 3000 chars
         if body:
-            # Split into chunks if needed
             while body:
                 chunk = body[:3000]
-                # Don't cut in the middle of a line
                 if len(body) > 3000:
                     last_newline = chunk.rfind("\n")
                     if last_newline > 0:
@@ -209,7 +236,6 @@ def _build_slack_blocks(report_text):
                     body = body[len(chunk):]
                 else:
                     body = ""
-
                 blocks.append({
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": chunk.strip()}
@@ -217,7 +243,6 @@ def _build_slack_blocks(report_text):
 
         blocks.append({"type": "divider"})
 
-    # Footer
     blocks.append({
         "type": "context",
         "elements": [
@@ -225,7 +250,6 @@ def _build_slack_blocks(report_text):
         ]
     })
 
-    # Slack limits to 50 blocks
     return blocks[:50]
 
 
@@ -239,14 +263,9 @@ def _post_to_slack(report_text, console):
     blocks = _build_slack_blocks(report_text)
     fallback = report_text[:3000] + "..." if len(report_text) > 3000 else report_text
 
-    payload = json.dumps({
-        "text": fallback,
-        "blocks": blocks,
-    }).encode("utf-8")
-
+    payload = json.dumps({"text": fallback, "blocks": blocks}).encode("utf-8")
     req = urllib.request.Request(
-        webhook_url,
-        data=payload,
+        webhook_url, data=payload,
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -260,9 +279,10 @@ def _post_to_slack(report_text, console):
         console.log(f"[red]\u2717 Slack error:[/red] {e}")
         return False
 
+# ─── Prompt + report helpers ───────────────────────────────
 
-def _load_prompt(now, watchlist_exclusions, active_contacts_section, scan_data):
-    """Load the prompt template from prompts/monitor.md and fill placeholders."""
+def _load_prompt(now, active_threads_content, unread_inbox_content, scan_data):
+    """Load the prompt template and fill all placeholders."""
     prompt_path = os.path.join(PROMPT_DIR, "monitor.md")
     today = now.strftime("%Y-%m-%d")
     today_long = now.strftime("%B %d, %Y")
@@ -270,53 +290,27 @@ def _load_prompt(now, watchlist_exclusions, active_contacts_section, scan_data):
     with open(prompt_path, "r", encoding="utf-8") as f:
         template = f.read()
 
-    # Escape agent-filled placeholders so Python's .format() doesn't touch them.
-    # {p1_count}, {p2_count}, {p3_count}, {draft_count} are written by the agent.
+    # Escape agent-filled placeholders
     safe_template = template.replace("{p1_count}", "{{p1_count}}")
     safe_template = safe_template.replace("{p2_count}", "{{p2_count}}")
     safe_template = safe_template.replace("{p3_count}", "{{p3_count}}")
-    safe_template = safe_template.replace("{draft_count}", "{{draft_count}}")
 
     return safe_template.format(
         today=today,
         today_long=today_long,
-        active_contacts_section=active_contacts_section,
-        watchlist_exclusions=watchlist_exclusions,
+        active_threads_content=active_threads_content,
+        unread_inbox_content=unread_inbox_content,
         total_watched=len(WATCHLIST),
         no_reply_count=len(scan_data["sent_no_reply"]),
         stale_count=len(scan_data["stale_threads"]),
         no_response_count=len(scan_data["no_response"]),
     )
 
-def _build_active_contacts_section(scan_data):
-    """Build the active-contacts block that gets injected into the prompt."""
-    active = scan_data["active_contacts"]
-    thread_ids = scan_data["thread_ids"]
-
-    if not active:
-        return (
-            "No active contacts found — skip to STEP 3 (unread inbox scan)."
-        )
-
-    lines = []
-    for email in active:
-        tids = thread_ids.get(email, [])
-        tid_str = ", ".join(tids) if tids else "(none)"
-        lines.append(f"Contact: {email}")
-        lines.append(f"  Thread IDs: {tid_str}")
-        lines.append("")
-    return "\n".join(lines).rstrip()
-
 
 def _build_local_sections(scan_data):
-    """Build the markdown sections that Python appends to the report.
-
-    These cover contacts the agent did NOT process: no-reply, stale, and
-    no-response lists produced by the local pre-filter.
-    """
+    """Build the markdown sections that Python appends to the report."""
     parts = []
 
-    # ── No Reply ──
     parts.append("## Watched Contacts \u2013 No Reply")
     if scan_data["sent_no_reply"]:
         for item in scan_data["sent_no_reply"]:
@@ -329,7 +323,6 @@ def _build_local_sections(scan_data):
 
     parts.append("")
 
-    # ── Stale Threads ──
     parts.append("## Watched Contacts \u2013 Stale Threads")
     if scan_data["stale_threads"]:
         for item in scan_data["stale_threads"]:
@@ -344,28 +337,22 @@ def _build_local_sections(scan_data):
 
     parts.append("")
 
-    # ── No Response ──
     parts.append("## Watched Contacts \u2013 No Response")
     if scan_data["no_response"]:
         for email in scan_data["no_response"]:
-            parts.append(
-                f"**{email}** \u2013 No response received"
-            )
+            parts.append(f"**{email}** \u2013 No response received")
     else:
         parts.append("None.")
 
     return "\n".join(parts)
 
-
 # ─── Main session logic ────────────────────────────────────
 
 def run_daily_check(username):
-    """Run a full outreach monitoring session and save the report."""
+    """Run a full outreach monitoring check and save the report."""
     console = Console()
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
-    report_lines = []
-    tool_call_count = 0
 
     # ── Header ──
     CREDIT = "Agent By: Baqir Hassan - LUMS - 27100340 for: Ticketly"
@@ -385,130 +372,59 @@ def run_daily_check(username):
 
     with console.status("[bold]Initializing...[/bold]", spinner="dots") as status:
 
-        # ── Pre-filter watchlist contacts ──
+        # ── Step 1: Pre-filter watchlist ──
         scan_data = scan_watchlist(gmail, WATCHLIST, console, status)
-        active_section = _build_active_contacts_section(scan_data)
+        active_contacts = scan_data["active_contacts"]
+        thread_ids = scan_data["thread_ids"]
 
-        # ── Run agent session (only if there's work to do) ──
-        has_active = len(scan_data["active_contacts"]) > 0
-
-        if has_active:
-            # Create session
-            status.update("[yellow]Creating agent session...[/yellow]")
-            session = anthropic_client.beta.sessions.create(
-                agent=AGENT_ID,
-                environment_id=ENVIRONMENT_ID,
-                title=f"Daily outreach check {today}",
-                betas=["managed-agents-2026-04-01"],
-            )
-            session_id = session.id
-            console.log("[green]\u2713[/green] Session created")
-
-            # Build and send prompt
-            status.update("[yellow]Sending monitoring prompt...[/yellow]")
-            watchlist_exclusions = " ".join(f"-from:{email}" for email in WATCHLIST)
-            prompt = _load_prompt(now, watchlist_exclusions, active_section, scan_data)
-
-            anthropic_client.beta.sessions.events.send(
-                session_id=session_id,
-                events=[{
-                    "type": "user.message",
-                    "content": [{"type": "text", "text": prompt}],
-                }],
-            )
-            console.log("[green]\u2713[/green] Prompt sent to agent")
-
-            # Stream and handle events
-            sent_tool_ids = set()
-            finished = False
-
-            while not finished:
-                status.update("[bold cyan]Agent is thinking...[/bold cyan]")
-
-                with anthropic_client.beta.sessions.events.stream(
-                    session_id=session_id,
-                ) as stream:
-                    for event in stream:
-                        event_type = getattr(event, "type", None)
-
-                        if event_type == "agent.custom_tool_use":
-                            tool_name = event.name
-                            tool_input = event.input
-                            tool_use_id = event.id
-
-                            friendly = _friendly_tool_message(tool_name, tool_input)
-                            status.update(f"[yellow]{friendly}...[/yellow]")
-
-                            if tool_name in TOOL_HANDLERS:
-                                try:
-                                    result = TOOL_HANDLERS[tool_name](tool_input)
-                                    is_error = False
-                                except Exception as e:
-                                    result = json.dumps({"error": str(e)})
-                                    is_error = True
-                                    console.log(f"[red]\u2717 Tool error:[/red] {e}")
-
-                                tool_call_count += 1
-                                console.log(f"[green]\u2713[/green] {friendly}")
-
-                                anthropic_client.beta.sessions.events.send(
-                                    session_id=session_id,
-                                    events=[{
-                                        "type": "user.custom_tool_result",
-                                        "custom_tool_use_id": tool_use_id,
-                                        "content": [{"type": "text", "text": result}],
-                                        "is_error": is_error,
-                                    }],
-                                )
-                                sent_tool_ids.add(tool_use_id)
-                            else:
-                                console.log(f"[red]\u2717[/red] Unknown custom tool: {tool_name}")
-
-                        elif event_type == "agent.tool_use":
-                            console.log(f"[blue]\u2192[/blue] Built-in tool: {event.name}")
-
-                        elif event_type == "agent.message":
-                            status.update("[cyan]Agent is writing report...[/cyan]")
-                            for block in event.content:
-                                if hasattr(block, "text"):
-                                    report_lines.append(block.text)
-
-                        elif event_type == "session.status_idle":
-                            stop_reason = getattr(event, "stop_reason", None)
-                            reason_type = getattr(stop_reason, "type", None)
-
-                            if reason_type == "requires_action":
-                                event_ids = getattr(stop_reason, "event_ids", [])
-                                unsent = [eid for eid in event_ids if eid not in sent_tool_ids]
-
-                                if unsent:
-                                    console.log(f"[red]\u2717[/red] Missing results for {len(unsent)} tool call(s)")
-                                    finished = True
-                                else:
-                                    console.log(f"[yellow]\u2192[/yellow] Agent processing results...")
-                                break
-                            else:
-                                console.log("[green]\u2713[/green] Agent finished processing")
-                                finished = True
-                                break
-
-                        elif event_type == "session.status_terminated":
-                            console.log("[red]\u2717[/red] Session terminated unexpectedly")
-                            finished = True
-                            break
-
-                        elif event_type == "session.error":
-                            error_msg = getattr(event, "error", "unknown error")
-                            console.log(f"[red]\u2717 Error:[/red] {error_msg}")
+        # ── Step 2: Read threads locally for active contacts ──
+        active_threads_content = ""
+        if active_contacts:
+            status.update("[yellow]Reading threads for active contacts...[/yellow]")
+            thread_parts = []
+            for email in active_contacts:
+                tids = thread_ids.get(email, [])
+                for tid in tids:
+                    console.log(f"[green]\u2713[/green] Reading thread for [cyan]{email}[/cyan]")
+                    content = _read_thread(tid)
+                    thread_parts.append(
+                        f"=== Contact: {email} | Thread: {tid} ===\n{content}"
+                    )
+            active_threads_content = "\n\n".join(thread_parts)
         else:
-            # No active contacts — skip the agent session entirely ($0 cost)
-            console.log("[green]\u2713[/green] No active contacts — skipping agent session (no cost)")
+            active_threads_content = "No active contacts with recent activity."
+
+        # ── Step 3: Read unread inbox (non-watched) ──
+        status.update("[yellow]Scanning unread inbox...[/yellow]")
+        watchlist_exclusions = " ".join(f"-from:{email}" for email in WATCHLIST)
+        unread_inbox_content = _search_unread_inbox(watchlist_exclusions)
+        console.log("[green]\u2713[/green] Unread inbox scanned")
+
+        # ── Step 4: Build prompt with all content embedded ──
+        status.update("[yellow]Building prompt...[/yellow]")
+        prompt = _load_prompt(now, active_threads_content, unread_inbox_content, scan_data)
+        console.log(f"[green]\u2713[/green] Prompt built ({len(prompt)} chars)")
+
+        # ── Step 5: Single API call to Claude ──
+        has_content = active_contacts or unread_inbox_content != "No other unread emails found."
+
+        if has_content:
+            status.update("[bold cyan]Claude is writing the report...[/bold cyan]")
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            report_from_claude = response.content[0].text
+            console.log("[green]\u2713[/green] Report generated")
+        else:
+            console.log("[green]\u2713[/green] No activity — building local report")
             today_long = now.strftime("%B %d, %Y")
-            report_lines.append(f"# Daily Inbox Summary \u2013 {today_long}\n\n")
-            report_lines.append("## P1 \u2013 Urgent (0)\nNone.\n\n")
-            report_lines.append("## P2 \u2013 Important (0)\nNone.\n\n")
-            report_lines.append("## P3 \u2013 Low Priority (0)\nNone.\n\n")
-            report_lines.append(
+            report_from_claude = (
+                f"# Daily Inbox Summary \u2013 {today_long}\n\n"
+                f"## P1 \u2013 Urgent (0)\nNone.\n\n"
+                f"## P2 \u2013 Important (0)\nNone.\n\n"
+                f"## P3 \u2013 Low Priority (0)\nNone.\n\n"
                 f"## 6. SUMMARY\n"
                 f"- {len(WATCHLIST)} contacts watched; no new activity today.\n"
                 f"- {len(scan_data['sent_no_reply'])} contacts awaiting first reply.\n"
@@ -520,7 +436,7 @@ def run_daily_check(username):
     # ── Save report ──
     local_sections = _build_local_sections(scan_data)
     report_text = (
-        "".join(report_lines)
+        report_from_claude
         + "\n\n"
         + local_sections
         + f"\n\n---\n*{CREDIT}*\n"
@@ -537,7 +453,6 @@ def run_daily_check(username):
     console.print()
     console.print(Panel(
         f"[bold green]\u2713 Complete![/bold green]\n\n"
-        f"[dim]Tool calls made:[/dim]  {tool_call_count}\n"
         f"[dim]Report saved to:[/dim]  [underline]{report_path}[/underline]",
         title="[bold green]Done[/bold green]",
         subtitle=f"[dim]{CREDIT}[/dim]",

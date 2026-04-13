@@ -31,7 +31,6 @@ jobs:
           mkdir -p config
           echo '${{ secrets.GOOGLE_CREDENTIALS }}' > config/credentials.json
           echo '${{ secrets.GOOGLE_TOKEN }}' > config/token.json
-          echo '${{ secrets.AGENT_CONFIG }}' > config/agent_config.json
 
       - name: Write .env from secrets
         run: |
