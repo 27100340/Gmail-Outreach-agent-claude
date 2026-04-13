@@ -91,9 +91,14 @@ RULES:
     betas=["managed-agents-2026-04-01"]
 )
 
-# Save the agent ID
-config = {"agent_id": agent.id, "agent_version": agent.version}
+# Save the agent ID — preserve existing config (e.g. environment_id)
 config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "agent_config.json")
+config = {}
+if os.path.exists(config_path):
+    with open(config_path, "r") as f:
+        config = json.load(f)
+config["agent_id"] = agent.id
+config["agent_version"] = agent.version
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
 

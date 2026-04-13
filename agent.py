@@ -389,113 +389,133 @@ def run_daily_check(username):
         scan_data = scan_watchlist(gmail, WATCHLIST, console, status)
         active_section = _build_active_contacts_section(scan_data)
 
-        # ── Create session ──
-        status.update("[yellow]Creating agent session...[/yellow]")
-        session = anthropic_client.beta.sessions.create(
-            agent=AGENT_ID,
-            environment_id=ENVIRONMENT_ID,
-            title=f"Daily outreach check {today}",
-            betas=["managed-agents-2026-04-01"],
-        )
-        session_id = session.id
-        console.log("[green]\u2713[/green] Session created")
+        # ── Run agent session (only if there's work to do) ──
+        has_active = len(scan_data["active_contacts"]) > 0
 
-        # ── Build and send prompt ──
-        status.update("[yellow]Sending monitoring prompt...[/yellow]")
-        watchlist_exclusions = " ".join(f"-from:{email}" for email in WATCHLIST)
-        prompt = _load_prompt(now, watchlist_exclusions, active_section, scan_data)
+        if has_active:
+            # Create session
+            status.update("[yellow]Creating agent session...[/yellow]")
+            session = anthropic_client.beta.sessions.create(
+                agent=AGENT_ID,
+                environment_id=ENVIRONMENT_ID,
+                title=f"Daily outreach check {today}",
+                betas=["managed-agents-2026-04-01"],
+            )
+            session_id = session.id
+            console.log("[green]\u2713[/green] Session created")
 
-        anthropic_client.beta.sessions.events.send(
-            session_id=session_id,
-            events=[{
-                "type": "user.message",
-                "content": [{"type": "text", "text": prompt}],
-            }],
-        )
-        console.log("[green]\u2713[/green] Prompt sent to agent")
+            # Build and send prompt
+            status.update("[yellow]Sending monitoring prompt...[/yellow]")
+            watchlist_exclusions = " ".join(f"-from:{email}" for email in WATCHLIST)
+            prompt = _load_prompt(now, watchlist_exclusions, active_section, scan_data)
 
-        # ── Stream and handle events ──
-        sent_tool_ids = set()
-        finished = False
-
-        while not finished:
-            status.update("[bold cyan]Agent is thinking...[/bold cyan]")
-
-            with anthropic_client.beta.sessions.events.stream(
+            anthropic_client.beta.sessions.events.send(
                 session_id=session_id,
-            ) as stream:
-                for event in stream:
-                    event_type = getattr(event, "type", None)
+                events=[{
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": prompt}],
+                }],
+            )
+            console.log("[green]\u2713[/green] Prompt sent to agent")
 
-                    if event_type == "agent.custom_tool_use":
-                        tool_name = event.name
-                        tool_input = event.input
-                        tool_use_id = event.id
+            # Stream and handle events
+            sent_tool_ids = set()
+            finished = False
 
-                        friendly = _friendly_tool_message(tool_name, tool_input)
-                        status.update(f"[yellow]{friendly}...[/yellow]")
+            while not finished:
+                status.update("[bold cyan]Agent is thinking...[/bold cyan]")
 
-                        if tool_name in TOOL_HANDLERS:
-                            try:
-                                result = TOOL_HANDLERS[tool_name](tool_input)
-                                is_error = False
-                            except Exception as e:
-                                result = json.dumps({"error": str(e)})
-                                is_error = True
-                                console.log(f"[red]\u2717 Tool error:[/red] {e}")
+                with anthropic_client.beta.sessions.events.stream(
+                    session_id=session_id,
+                ) as stream:
+                    for event in stream:
+                        event_type = getattr(event, "type", None)
 
-                            tool_call_count += 1
-                            console.log(f"[green]\u2713[/green] {friendly}")
+                        if event_type == "agent.custom_tool_use":
+                            tool_name = event.name
+                            tool_input = event.input
+                            tool_use_id = event.id
 
-                            anthropic_client.beta.sessions.events.send(
-                                session_id=session_id,
-                                events=[{
-                                    "type": "user.custom_tool_result",
-                                    "custom_tool_use_id": tool_use_id,
-                                    "content": [{"type": "text", "text": result}],
-                                    "is_error": is_error,
-                                }],
-                            )
-                            sent_tool_ids.add(tool_use_id)
-                        else:
-                            console.log(f"[red]\u2717[/red] Unknown custom tool: {tool_name}")
+                            friendly = _friendly_tool_message(tool_name, tool_input)
+                            status.update(f"[yellow]{friendly}...[/yellow]")
 
-                    elif event_type == "agent.tool_use":
-                        console.log(f"[blue]\u2192[/blue] Built-in tool: {event.name}")
+                            if tool_name in TOOL_HANDLERS:
+                                try:
+                                    result = TOOL_HANDLERS[tool_name](tool_input)
+                                    is_error = False
+                                except Exception as e:
+                                    result = json.dumps({"error": str(e)})
+                                    is_error = True
+                                    console.log(f"[red]\u2717 Tool error:[/red] {e}")
 
-                    elif event_type == "agent.message":
-                        status.update("[cyan]Agent is writing report...[/cyan]")
-                        for block in event.content:
-                            if hasattr(block, "text"):
-                                report_lines.append(block.text)
+                                tool_call_count += 1
+                                console.log(f"[green]\u2713[/green] {friendly}")
 
-                    elif event_type == "session.status_idle":
-                        stop_reason = getattr(event, "stop_reason", None)
-                        reason_type = getattr(stop_reason, "type", None)
-
-                        if reason_type == "requires_action":
-                            event_ids = getattr(stop_reason, "event_ids", [])
-                            unsent = [eid for eid in event_ids if eid not in sent_tool_ids]
-
-                            if unsent:
-                                console.log(f"[red]\u2717[/red] Missing results for {len(unsent)} tool call(s)")
-                                finished = True
+                                anthropic_client.beta.sessions.events.send(
+                                    session_id=session_id,
+                                    events=[{
+                                        "type": "user.custom_tool_result",
+                                        "custom_tool_use_id": tool_use_id,
+                                        "content": [{"type": "text", "text": result}],
+                                        "is_error": is_error,
+                                    }],
+                                )
+                                sent_tool_ids.add(tool_use_id)
                             else:
-                                console.log(f"[yellow]\u2192[/yellow] Agent processing results...")
-                            break
-                        else:
-                            console.log("[green]\u2713[/green] Agent finished processing")
+                                console.log(f"[red]\u2717[/red] Unknown custom tool: {tool_name}")
+
+                        elif event_type == "agent.tool_use":
+                            console.log(f"[blue]\u2192[/blue] Built-in tool: {event.name}")
+
+                        elif event_type == "agent.message":
+                            status.update("[cyan]Agent is writing report...[/cyan]")
+                            for block in event.content:
+                                if hasattr(block, "text"):
+                                    report_lines.append(block.text)
+
+                        elif event_type == "session.status_idle":
+                            stop_reason = getattr(event, "stop_reason", None)
+                            reason_type = getattr(stop_reason, "type", None)
+
+                            if reason_type == "requires_action":
+                                event_ids = getattr(stop_reason, "event_ids", [])
+                                unsent = [eid for eid in event_ids if eid not in sent_tool_ids]
+
+                                if unsent:
+                                    console.log(f"[red]\u2717[/red] Missing results for {len(unsent)} tool call(s)")
+                                    finished = True
+                                else:
+                                    console.log(f"[yellow]\u2192[/yellow] Agent processing results...")
+                                break
+                            else:
+                                console.log("[green]\u2713[/green] Agent finished processing")
+                                finished = True
+                                break
+
+                        elif event_type == "session.status_terminated":
+                            console.log("[red]\u2717[/red] Session terminated unexpectedly")
                             finished = True
                             break
 
-                    elif event_type == "session.status_terminated":
-                        console.log("[red]\u2717[/red] Session terminated unexpectedly")
-                        finished = True
-                        break
-
-                    elif event_type == "session.error":
-                        error_msg = getattr(event, "error", "unknown error")
-                        console.log(f"[red]\u2717 Error:[/red] {error_msg}")
+                        elif event_type == "session.error":
+                            error_msg = getattr(event, "error", "unknown error")
+                            console.log(f"[red]\u2717 Error:[/red] {error_msg}")
+        else:
+            # No active contacts — skip the agent session entirely ($0 cost)
+            console.log("[green]\u2713[/green] No active contacts — skipping agent session (no cost)")
+            today_long = now.strftime("%B %d, %Y")
+            report_lines.append(f"# Daily Inbox Summary \u2013 {today_long}\n\n")
+            report_lines.append("## P1 \u2013 Urgent (0)\nNone.\n\n")
+            report_lines.append("## P2 \u2013 Important (0)\nNone.\n\n")
+            report_lines.append("## P3 \u2013 Low Priority (0)\nNone.\n\n")
+            report_lines.append(
+                f"## 6. SUMMARY\n"
+                f"- {len(WATCHLIST)} contacts watched; no new activity today.\n"
+                f"- {len(scan_data['sent_no_reply'])} contacts awaiting first reply.\n"
+                f"- {len(scan_data['stale_threads'])} stale threads.\n"
+                f"- {len(scan_data['no_response'])} contacts with no response.\n\n"
+                f"**Drafts created: 0**\n"
+            )
 
     # ── Save report ──
     local_sections = _build_local_sections(scan_data)

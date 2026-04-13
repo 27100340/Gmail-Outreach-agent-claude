@@ -78,7 +78,7 @@ def handle_gmail_get_thread(gmail, params):
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
             "message_id": headers.get("Message-ID", ""),
-            "body": body[:2000]
+            "body": body[:500]
         })
 
     return json.dumps(msgs, indent=2)
