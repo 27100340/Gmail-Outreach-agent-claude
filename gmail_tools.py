@@ -85,7 +85,30 @@ def handle_gmail_get_thread(gmail, params):
 
 
 def handle_gmail_create_draft(gmail, params):
-    """Create a draft email (never sends)."""
+    """Create a draft email, skipping if a draft to that recipient already exists."""
+    to_addr = params["to"].lower().strip()
+
+    # Check for existing drafts to this recipient
+    drafts_resp = gmail.users().drafts().list(userId="me", maxResults=100).execute()
+    for d in drafts_resp.get("drafts", []):
+        draft_detail = gmail.users().drafts().get(
+            userId="me", id=d["id"], format="metadata"
+        ).execute()
+        headers = {
+            h["name"]: h["value"]
+            for h in draft_detail.get("message", {}).get("payload", {}).get("headers", [])
+        }
+        draft_to = headers.get("To", "").lower()
+        if to_addr in draft_to:
+            return json.dumps({
+                "status": "draft_already_exists",
+                "draft_id": d["id"],
+                "to": params["to"],
+                "subject": headers.get("Subject", ""),
+                "message": f"A draft to {params['to']} already exists. Skipped."
+            })
+
+    # No existing draft found — create one
     message = MIMEText(params["body"])
     message["to"] = params["to"]
     message["subject"] = params["subject"]

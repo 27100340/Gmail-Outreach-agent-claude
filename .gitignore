@@ -5,6 +5,7 @@ config/
 .claude/
 # Generated output
 reports/
+docs/superpowers/
 
 # Python
 __pycache__/
