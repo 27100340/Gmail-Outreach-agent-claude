@@ -32,15 +32,26 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(ROOT_DIR, "config")
 PROMPT_DIR = os.path.join(ROOT_DIR, "prompts")
 REPORT_DIR = os.path.join(ROOT_DIR, "reports")
+WATCHLIST_FILE = os.path.join(ROOT_DIR, "watchlist", "contacts.txt")
 
 TOKEN_FILE = os.path.join(CONFIG_DIR, "token.json")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "agent_config.json")
 
 # ─── Watchlist ──────────────────────────────────────────────
 
-WATCHLIST = [
-    "27100340@lums.edu.pk",
-]
+def _load_watchlist():
+    """Load email addresses from watchlist/contacts.txt."""
+    with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    emails = [
+        line.strip() for line in lines
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not emails:
+        raise SystemExit("Watchlist is empty. Add emails to watchlist/contacts.txt")
+    return emails
+
+WATCHLIST = _load_watchlist()
 
 # ─── Initialization ─────────────────────────────────────────
 
